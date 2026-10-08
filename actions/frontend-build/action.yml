@@ -1,0 +1,226 @@
+name: frontend-build
+description: >
+  Provider-agnostic frontend build: detects the package manager, sets up
+  Node with caching, installs deps, injects prefixed env vars, builds, and
+  skips the whole thing when the working directory's source tree is
+  unchanged from a previous successful build.
+inputs:
+  working-directory:
+    description: "Directory containing package.json, e.g. 'frontend'."
+    required: false
+    default: "."
+  node-version-file:
+    description: "Path to an .nvmrc-style file, relative to the repo root."
+    required: false
+    default: ""
+  package-manager:
+    description: "pnpm | npm | yarn | bun | auto (detect from lockfile)."
+    required: false
+    default: "auto"
+  install-command:
+    description: "Overrides the default '<pm> install --frozen-lockfile' equivalent."
+    required: false
+    default: ""
+  build-command:
+    description: "Overrides the default '<pm> run build'."
+    required: false
+    default: ""
+  output-dir:
+    description: "Build output directory, relative to working-directory."
+    required: false
+    default: "dist"
+  env-prefix:
+    description: >
+      Every repository/environment variable (vars context) whose name
+      starts with this prefix is exported to the install/build steps.
+      Set to "" to disable.
+    required: false
+    default: "VITE_"
+  vars-json:
+    description: >
+      JSON object of the caller's `vars` context (pass `${{ toJSON(vars) }}`).
+      Needed because composite actions cannot read the caller's vars directly.
+    required: false
+    default: "{}"
+  build-env:
+    description: "Extra multiline KEY=VALUE pairs, exported in addition to env-prefix matches."
+    required: false
+    default: ""
+  skip-unchanged:
+    description: "Skip install+build when the source tree hash matches the last successful build."
+    required: false
+    default: "true"
+outputs:
+  skipped:
+    description: "'true' if the build was skipped because nothing changed."
+    value: ${{ steps.final.outputs.skipped }}
+  output-path:
+    description: "Resolved path to the build output directory."
+    value: ${{ steps.decide.outputs.output_path }}
+  package-manager:
+    description: "The package manager that was used."
+    value: ${{ steps.detect.outputs.pm }}
+runs:
+  using: composite
+  steps:
+    - name: Detect package manager
+      id: detect
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        pm="${{ inputs.package-manager }}"
+        if [ "$pm" = "auto" ]; then
+          if [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
+          elif [ -f "yarn.lock" ]; then pm="yarn"
+          elif [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then pm="bun"
+          elif [ -f "package-lock.json" ]; then pm="npm"
+          else
+            echo "::warning::frontend-build: no lockfile found, defaulting to npm"
+            pm="npm"
+          fi
+        fi
+        echo "pm=$pm" >> "$GITHUB_OUTPUT"
+
+        pnpm_version=""
+        if [ "$pm" = "pnpm" ] && [ -f "package.json" ]; then
+          pnpm_version=$(grep -oP '"packageManager"\s*:\s*"pnpm@\K[0-9.]+' package.json || true)
+        fi
+        echo "pnpm_version=${pnpm_version:-9}" >> "$GITHUB_OUTPUT"
+
+    - name: Install pnpm
+      if: steps.detect.outputs.pm == 'pnpm'
+      uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4
+      with:
+        version: ${{ steps.detect.outputs.pnpm_version }}
+
+    - name: Resolve node-version-file
+      id: nodefile
+      shell: bash
+      run: |
+        candidates=(
+          "${{ inputs.node-version-file }}"
+          "${{ inputs.working-directory }}/.nvmrc"
+          ".nvmrc"
+        )
+        resolved=""
+        for c in "${candidates[@]}"; do
+          [ -z "$c" ] && continue
+          if [ -f "$c" ]; then resolved="$c"; break; fi
+        done
+        echo "path=$resolved" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Node (cached)
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v5
+      with:
+        node-version-file: ${{ steps.nodefile.outputs.path || '' }}
+        node-version: ${{ steps.nodefile.outputs.path == '' && '22' || '' }}
+        cache: ${{ steps.detect.outputs.pm == 'yarn' && 'yarn' || steps.detect.outputs.pm }}
+        cache-dependency-path: |
+          ${{ inputs.working-directory }}/pnpm-lock.yaml
+          ${{ inputs.working-directory }}/package-lock.json
+          ${{ inputs.working-directory }}/yarn.lock
+          ${{ inputs.working-directory }}/bun.lock
+
+    - name: Allow Wrangler/tooling install at a workspace root
+      if: steps.detect.outputs.pm == 'pnpm'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: pnpm config set ignore-workspace-root-check true
+
+    - name: Compute source hash and decide whether to skip
+      id: decide
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        output_path="$(pwd)/${{ inputs.output-dir }}"
+        echo "output_path=$output_path" >> "$GITHUB_OUTPUT"
+
+        if [ "${{ inputs.skip-unchanged }}" != "true" ]; then
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        tree_hash=$(git rev-parse "HEAD:${{ inputs.working-directory }}" 2>/dev/null || echo "no-tree")
+        cache_key="frontend-build-${{ steps.detect.outputs.pm }}-${tree_hash}"
+        echo "cache-key=$cache_key" >> "$GITHUB_OUTPUT"
+
+    - name: Restore previous build output
+      if: inputs.skip-unchanged == 'true'
+      id: cache-dist
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ inputs.working-directory }}/${{ inputs.output-dir }}
+        key: ${{ steps.decide.outputs.cache-key }}
+
+    - name: Mark build as skipped
+      if: inputs.skip-unchanged == 'true' && steps.cache-dist.outputs.cache-hit == 'true'
+      shell: bash
+      run: echo "SKIPPED=true" >> "$GITHUB_ENV"
+
+    - name: Export env-prefix vars
+      if: env.SKIPPED != 'true'
+      shell: bash
+      env:
+        VARS_JSON: ${{ inputs.vars-json }}
+        PREFIX: ${{ inputs.env-prefix }}
+      run: |
+        [ -z "$PREFIX" ] && exit 0
+        names=""
+        while IFS='=' read -r key value; do
+          [ -z "$key" ] && continue
+          echo "$key=$value" >> "$GITHUB_ENV"
+          names="${names:+$names, }$key"
+        done < <(echo "$VARS_JSON" | jq -r --arg p "$PREFIX" 'to_entries[] | select(.key | startswith($p)) | "\(.key)=\(.value)"')
+        {
+          echo "### 🧩 Injected build-time env vars"
+          if [ -n "$names" ]; then
+            echo "Prefix \`${PREFIX}\`: ${names}"
+          else
+            echo "Prefix \`${PREFIX}\`: none matched"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Export extra build-env
+      if: env.SKIPPED != 'true' && inputs.build-env != ''
+      shell: bash
+      env:
+        BUILD_ENV: ${{ inputs.build-env }}
+      run: echo "$BUILD_ENV" >> "$GITHUB_ENV"
+
+    - name: Install dependencies
+      if: env.SKIPPED != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ -n "${{ inputs.install-command }}" ]; then
+          eval "${{ inputs.install-command }}"
+          exit 0
+        fi
+        case "${{ steps.detect.outputs.pm }}" in
+          pnpm) pnpm install --frozen-lockfile ;;
+          yarn) yarn install --frozen-lockfile ;;
+          bun)  bun install --frozen-lockfile ;;
+          npm)  npm ci ;;
+        esac
+
+    - name: Build
+      if: env.SKIPPED != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ -n "${{ inputs.build-command }}" ]; then
+          eval "${{ inputs.build-command }}"
+          exit 0
+        fi
+        "${{ steps.detect.outputs.pm }}" run build
+
+    - name: Report skip status
+      id: final
+      shell: bash
+      run: |
+        if [ "${{ env.SKIPPED }}" = "true" ]; then
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+          echo "frontend-build: source unchanged, reusing cached ${{ inputs.output-dir }}/" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+        fi

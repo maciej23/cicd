@@ -1,0 +1,23 @@
+name: frontend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: maciej23/cicd/.github/workflows/frontend-cloudflare.yml@v1
+    with:
+      working-directory: frontend
+      project-name: myapp-dev
+      environment: dev
+      environment-url: https://myapp-dev.example.com
+      notify-on: failure
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      NOTIFY_URL: ${{ secrets.NOTIFY_URL }}

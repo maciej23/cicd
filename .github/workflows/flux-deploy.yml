@@ -1,0 +1,277 @@
+name: flux-deploy
+
+# Reusable workflow: bump image tag(s) in a flux-config kustomization and
+# push the commit, which Flux then reconciles.
+#
+# Monorepo support: `images` is multiline, so several images (api + worker,
+# say) are bumped in one atomic commit.
+#
+# No docker pull of a kustomize image: the kustomization.yaml's `images:`
+# list is edited directly with yq.
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: >
+          Required. Multiline list of "name=tag" or "name=tag@sha256:...".
+          `name` must match an entry in the kustomization's `images:` list
+          (or a new entry is appended).
+        type: string
+        required: true
+      path:
+        description: "Required. Directory in the flux repo containing kustomization.yaml, e.g. apps/plume/sportino."
+        type: string
+        required: true
+      flux-repo:
+        type: string
+        default: "maciej23/flux-config"
+      flux-branch:
+        type: string
+        default: "main"
+      environment:
+        description: "GitHub Environment to run this job under (for protection rules / deployment history). Empty = none."
+        type: string
+        default: ""
+      app-name:
+        description: "Used in the commit message and notifications. Defaults to the calling repo's name."
+        type: string
+        default: ""
+      changelog-paths:
+        description: "Multiline list of paths (in the calling repo) to scope the changelog to. Empty = whole repo."
+        type: string
+        default: ""
+      commit-message:
+        description: "Template; {app} and {images} are substituted."
+        type: string
+        default: "chore({app}): deploy {images}"
+      notify-on:
+        type: string
+        default: ""
+    secrets:
+      FLUX_TOKEN:
+        description: "PAT with push access to flux-repo."
+        required: true
+      NOTIFY_URL:
+        required: false
+    outputs:
+      changed:
+        description: "'true' if a commit was pushed."
+        value: ${{ jobs.deploy.outputs.changed }}
+      flux-commit:
+        description: "SHA of the commit pushed to the flux repo (empty if nothing changed)."
+        value: ${{ jobs.deploy.outputs.flux_commit }}
+      changelog:
+        description: "Changelog since the previously deployed tag of the first image."
+        value: ${{ jobs.deploy.outputs.changelog }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: flux-deploy-${{ inputs.flux-repo }}-${{ inputs.path }}
+      cancel-in-progress: false
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+      flux_commit: ${{ steps.commit.outputs.sha }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    steps:
+      - name: Checkout calling repo (full history, for the changelog)
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+        with:
+          path: app
+          fetch-depth: 0
+
+      - name: Resolve app name
+        id: app
+        shell: bash
+        run: |
+          name="${{ inputs.app-name }}"
+          [ -z "$name" ] && name="$(basename "${GITHUB_REPOSITORY}")"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Install yq
+        shell: bash
+        run: |
+          curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Checkout flux-config
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+        with:
+          repository: ${{ inputs.flux-repo }}
+          ref: ${{ inputs.flux-branch }}
+          token: ${{ secrets.FLUX_TOKEN }}
+          path: flux-config
+
+      - name: Capture previous tag of the primary image
+        id: prev
+        shell: bash
+        run: |
+          kfile="flux-config/${{ inputs.path }}/kustomization.yaml"
+          primary_name="$(head -n1 <<< "${{ inputs.images }}" | cut -d= -f1)"
+          prev_tag=$(yq e ".images[] | select(.name == \"${primary_name}\") | .newTag" "$kfile" 2>/dev/null || true)
+          echo "tag=${prev_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Update image tags
+        id: update
+        shell: bash
+        run: |
+          kfile="flux-config/${{ inputs.path }}/kustomization.yaml"
+          if [ ! -f "$kfile" ]; then
+            echo "::error::kustomization not found at $kfile"
+            exit 1
+          fi
+
+          summary_lines=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            name="${line%%=*}"
+            rest="${line#*=}"
+            tag="${rest%%@*}"
+            digest=""
+            [[ "$rest" == *"@"* ]] && digest="${rest#*@}"
+
+            exists=$(yq e ".images[] | select(.name == \"${name}\") | .name" "$kfile")
+            if [ -z "$exists" ]; then
+              yq e -i ".images += [{\"name\": \"${name}\", \"newTag\": \"${tag}\"}]" "$kfile"
+            else
+              yq e -i "(.images[] | select(.name == \"${name}\")).newTag = \"${tag}\"" "$kfile"
+            fi
+            if [ -n "$digest" ]; then
+              yq e -i "(.images[] | select(.name == \"${name}\")).digest = \"${digest}\"" "$kfile"
+            else
+              yq e -i "(.images[] | select(.name == \"${name}\")) |= del(.digest)" "$kfile"
+            fi
+            summary_lines="${summary_lines}${name}|${tag}"$'\n'
+          done <<< "${{ inputs.images }}"
+
+          {
+            echo 'summary<<EOF'
+            printf '%s' "$summary_lines"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build changelog since last deploy
+        id: changelog
+        shell: bash
+        env:
+          PREV_TAG: ${{ steps.prev.outputs.tag }}
+          CHANGELOG_PATHS: ${{ inputs.changelog-paths }}
+        run: |
+          {
+            echo 'changelog<<EOF'
+            if [ -z "$PREV_TAG" ]; then
+              echo "_No previous deployment found - this is the first tracked release._"
+            else
+              prev_sha=$(grep -oP '(?:sha-)?\K[0-9a-f]{7,40}$' <<< "$PREV_TAG" || true)
+              if [ -n "$prev_sha" ] && git -C app cat-file -e "${prev_sha}^{commit}" 2>/dev/null; then
+                paths_args=()
+                while IFS= read -r p; do
+                  [ -z "$p" ] && continue
+                  paths_args+=("$p")
+                done <<< "$CHANGELOG_PATHS"
+                log=$(git -C app log "${prev_sha}..HEAD" --pretty=format:'- %s (%h)' -- "${paths_args[@]}" | head -n 20)
+                if [ -z "$log" ]; then
+                  echo "_No new commits since last deploy._"
+                else
+                  echo "$log"
+                fi
+              else
+                echo "_Previous tag '${PREV_TAG}' not resolvable to a known commit, skipping changelog._"
+              fi
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push flux-config
+        id: commit
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.app.outputs.name }}
+          IMAGES: ${{ inputs.images }}
+          COMMIT_TEMPLATE: ${{ inputs.commit-message }}
+        run: |
+          cd flux-config
+          kfile="${{ inputs.path }}/kustomization.yaml"
+
+          if git diff --quiet -- "$kfile"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "No image tag change detected"
+            exit 0
+          fi
+
+          images_summary=$(echo "$IMAGES" | tr '\n' ' ' | sed 's/ *$//')
+          msg="${COMMIT_TEMPLATE/\{app\}/$APP_NAME}"
+          msg="${msg/\{images\}/$images_summary}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$kfile"
+          git commit -m "$msg"
+
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${{ inputs.flux-branch }}"; then
+              break
+            fi
+            echo "Push rejected (attempt ${attempt}), rebasing onto latest and retrying..."
+            git fetch origin "${{ inputs.flux-branch }}"
+            git rebase "origin/${{ inputs.flux-branch }}"
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Failed to push to flux-config after 5 attempts"
+              exit 1
+            fi
+          done
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Write deploy summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## 🚀 Flux deploy - \`${{ steps.app.outputs.name }}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Environment | \`${{ inputs.environment || '-' }}\` |"
+            echo "| Flux path | \`${{ inputs.path }}\` |"
+            echo "| Changed | \`${{ steps.commit.outputs.changed }}\` |"
+            if [ -n "${{ steps.commit.outputs.sha }}" ]; then
+              echo "| Commit | [${{ steps.commit.outputs.sha }}](https://github.com/${{ inputs.flux-repo }}/commit/${{ steps.commit.outputs.sha }}) |"
+            fi
+            echo
+            echo "### Images"
+            echo '```'
+            echo "${{ inputs.images }}"
+            echo '```'
+            echo
+            echo "### Changelog since last deploy"
+            echo "${{ steps.changelog.outputs.changelog }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify - deploy failed
+        if: failure() && contains(inputs.notify-on, 'failure')
+        uses: maciej23/cicd/actions/notify@v1
+        with:
+          notify-url: ${{ secrets.NOTIFY_URL }}
+          status: failure
+          title: "🚨 Deploy failed: ${{ steps.app.outputs.name }}"
+          fields: |
+            Environment|${{ inputs.environment || 'n/a' }}
+            Flux path|${{ inputs.path }}
+
+      - name: Notify - deployed
+        if: success() && steps.commit.outputs.changed == 'true' && contains(inputs.notify-on, 'success')
+        uses: maciej23/cicd/actions/notify@v1
+        with:
+          notify-url: ${{ secrets.NOTIFY_URL }}
+          status: success
+          title: "🚀🎉 Deployed ${{ steps.app.outputs.name }} to ${{ inputs.environment || inputs.path }}!"
+          description: ${{ steps.changelog.outputs.changelog }}
+          fields: |
+            Flux path|${{ inputs.path }}
+            Images|${{ inputs.images }}

@@ -1,0 +1,64 @@
+# Monorepo with several Dockerfiles, built as a matrix, deployed together
+# in one flux-config commit. Deploy tags must be deterministic from the
+# commit sha (not read back from matrix outputs - "last job wins" there),
+# which docker-build.yml's guaranteed `sha-<short sha>` tag gives you.
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.filter.outputs.changed_keys }}
+      short_sha: ${{ steps.sha.outputs.value }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'api/**'
+            worker:
+              - 'worker/**'
+          list-files: none
+      - id: sha
+        run: echo "value=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.components != '[]'
+    strategy:
+      matrix:
+        component: ${{ fromJSON(needs.changes.outputs.components) }}
+    uses: maciej23/cicd/.github/workflows/docker-build.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    with:
+      context: ${{ matrix.component }}
+      notify-on: failure
+    secrets:
+      NOTIFY_URL: ${{ secrets.NOTIFY_URL }}
+
+  deploy:
+    needs: [changes, build]
+    if: always() && needs.build.result == 'success'
+    uses: maciej23/cicd/.github/workflows/flux-deploy.yml@v1
+    with:
+      environment: production
+      path: apps/plume/myapp
+      # Deterministic from the commit sha, so this doesn't depend on which
+      # matrix job's outputs "won". Matches docker-build.yml's guaranteed
+      # sha-<short sha> tag.
+      images: |
+        ghcr.io/myorg/myapp-api=sha-${{ needs.changes.outputs.short_sha }}
+        ghcr.io/myorg/myapp-worker=sha-${{ needs.changes.outputs.short_sha }}
+      notify-on: success,failure
+    secrets:
+      FLUX_TOKEN: ${{ secrets.FLUX_CONFIG_PUSH_TOKEN }}
+      NOTIFY_URL: ${{ secrets.NOTIFY_URL }}

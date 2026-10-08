@@ -1,0 +1,160 @@
+name: frontend-cloudflare
+
+# Reusable workflow: build a static frontend and deploy it to Cloudflare
+# Pages. The build step is provider-agnostic (actions/frontend-build); only
+# the deploy step here is Cloudflare-specific, so a future
+# frontend-<other-provider>.yml can reuse the same build action.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        type: string
+        default: "."
+      node-version-file:
+        type: string
+        default: ""
+      package-manager:
+        type: string
+        default: "auto"
+      install-command:
+        type: string
+        default: ""
+      build-command:
+        type: string
+        default: ""
+      output-dir:
+        type: string
+        default: "dist"
+      env-prefix:
+        description: "Every var() starting with this prefix is exported to the build. Set to '' to disable."
+        type: string
+        default: "VITE_"
+      build-env:
+        type: string
+        default: ""
+      skip-unchanged:
+        type: boolean
+        default: true
+      project-name:
+        description: "Required. Cloudflare Pages project name."
+        type: string
+        required: true
+      branch:
+        description: "Pages branch (controls production vs. preview deploy). Defaults to the triggering ref."
+        type: string
+        default: ""
+      environment:
+        type: string
+        default: ""
+      environment-url:
+        type: string
+        default: ""
+      wrangler-version:
+        type: string
+        default: "4"
+      notify-on:
+        type: string
+        default: ""
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      NOTIFY_URL:
+        required: false
+    outputs:
+      deployment-url:
+        value: ${{ jobs.deploy.outputs.deployment_url }}
+      alias-url:
+        value: ${{ jobs.deploy.outputs.alias_url }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      deployment_url: ${{ steps.pages.outputs.deployment-url }}
+      alias_url: ${{ steps.pages.outputs.alias-url || steps.pages.outputs.deployment-url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+
+      - name: Build frontend
+        id: build
+        uses: maciej23/cicd/actions/frontend-build@v1
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          node-version-file: ${{ inputs.node-version-file }}
+          package-manager: ${{ inputs.package-manager }}
+          install-command: ${{ inputs.install-command }}
+          build-command: ${{ inputs.build-command }}
+          output-dir: ${{ inputs.output-dir }}
+          env-prefix: ${{ inputs.env-prefix }}
+          vars-json: ${{ toJSON(vars) }}
+          build-env: ${{ inputs.build-env }}
+          skip-unchanged: ${{ inputs.skip-unchanged }}
+
+      - name: Deploy to Cloudflare Pages
+        id: pages
+        uses: cloudflare/wrangler-action@392082e81ffbcb9ebdde27400634aa004b35535b # v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          gitHubToken: ${{ github.token }}
+          command: >-
+            pages deploy ${{ inputs.output-dir }}
+            --project-name=${{ inputs.project-name }}
+            --branch=${{ inputs.branch || github.ref_name }}
+          wranglerVersion: ${{ inputs.wrangler-version }}
+          workingDirectory: ${{ inputs.working-directory }}
+
+      - name: Write deploy summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## ☁️ Cloudflare Pages - \`${{ inputs.project-name }}\`"
+            echo
+            if [ "${{ steps.build.outputs.skipped }}" = "true" ]; then
+              echo "> ♻️ Source unchanged, reused the previous build output."
+            fi
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Branch | \`${{ inputs.branch || github.ref_name }}\` |"
+            echo "| URL | ${{ steps.pages.outputs.deployment-url }} |"
+            if [ -n "${{ steps.pages.outputs.alias-url }}" ]; then
+              echo "| Alias | ${{ steps.pages.outputs.alias-url }} |"
+            fi
+            echo
+            du_output=""
+            if [ -d "${{ steps.build.outputs.output-path }}" ]; then
+              echo "### Largest build artifacts"
+              echo '```'
+              du -ah "${{ steps.build.outputs.output-path }}" 2>/dev/null | sort -rh | head -n 10
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify - deploy failed
+        if: failure() && contains(inputs.notify-on, 'failure')
+        uses: maciej23/cicd/actions/notify@v1
+        with:
+          notify-url: ${{ secrets.NOTIFY_URL }}
+          status: failure
+          title: "💥 Frontend deploy failed: ${{ inputs.project-name }}"
+          fields: |
+            Branch|${{ inputs.branch || github.ref_name }}
+
+      - name: Notify - deployed
+        if: success() && contains(inputs.notify-on, 'success')
+        uses: maciej23/cicd/actions/notify@v1
+        with:
+          notify-url: ${{ secrets.NOTIFY_URL }}
+          status: success
+          title: "🚀 Frontend deployed: ${{ inputs.project-name }}"
+          url: ${{ steps.pages.outputs.deployment-url }}
+          fields: |
+            Branch|${{ inputs.branch || github.ref_name }}
+            URL|${{ steps.pages.outputs.deployment-url }}

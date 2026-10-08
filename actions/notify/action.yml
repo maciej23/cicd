@@ -1,0 +1,68 @@
+name: notify
+description: >
+  Send a build/deploy notification to a pluggable provider, selected by the
+  scheme of NOTIFY_URL (discord://, telegram://, ...). No-op if the URL is
+  empty, so callers are opt-in by default. Never fails the calling job.
+inputs:
+  notify-url:
+    description: >
+      Destination, e.g. discord://<webhook_id>/<webhook_token> or
+      telegram://<bot_token>@<chat_id>[?thread=<topic_id>]. Empty disables
+      the notification entirely.
+    required: false
+    default: ""
+  status:
+    description: "started | success | failure"
+    required: true
+  title:
+    description: "Headline for the notification."
+    required: true
+  url:
+    description: "Link the headline points to. Defaults to this workflow run."
+    required: false
+    default: ""
+  description:
+    description: "Optional free-text body (e.g. a changelog)."
+    required: false
+    default: ""
+  fields:
+    description: >
+      Optional multiline list of "Name|Value" pairs, rendered as a field
+      list / table by the provider. One pair per line.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Dispatch notification
+      shell: bash
+      env:
+        NOTIFY_URL: ${{ inputs.notify-url }}
+        STATUS: ${{ inputs.status }}
+        TITLE: ${{ inputs.title }}
+        LINK: ${{ inputs.url }}
+        DESCRIPTION: ${{ inputs.description }}
+        FIELDS: ${{ inputs.fields }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set +e
+
+        if [ -z "$NOTIFY_URL" ]; then
+          echo "notify: NOTIFY_URL not set, skipping (notifications are opt-in)"
+          exit 0
+        fi
+
+        scheme="${NOTIFY_URL%%://*}"
+        provider_script="${ACTION_PATH}/providers/${scheme}.sh"
+
+        if [ ! -x "$provider_script" ] && [ ! -f "$provider_script" ]; then
+          echo "::warning::notify: no provider for scheme '${scheme}' (looked for providers/${scheme}.sh)"
+          exit 0
+        fi
+
+        bash "$provider_script"
+        rc=$?
+        if [ $rc -ne 0 ]; then
+          echo "::warning::notify: provider '${scheme}' failed (exit ${rc}), ignoring so the build/deploy result is unaffected"
+        fi
+        exit 0

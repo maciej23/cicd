@@ -1,0 +1,331 @@
+name: docker-build
+
+# Reusable workflow: build (and usually push) a container image.
+#
+# Monorepo support: point `context` at a subdirectory, e.g. `backend` or
+# `services/worker`; each caller job gets its own image.
+#
+# Multiple tags: `tags` is passed straight through to docker/metadata-action,
+# so `type=raw,value=dev` + `type=raw,value=dev-{{sha}}` gives you both
+# `dev` and `dev-<short sha>`. A `sha-<short sha>` tag is ALWAYS added on
+# top of whatever you ask for, so `outputs.tag` is always a real, stable,
+# per-commit tag you can hand to flux-deploy.
+#
+# Caching: registry-based buildx cache per image (no GHA cache size/eviction
+# limits), shared across branches. Unchanged source trees are detected and
+# retagged instead of rebuilt (`skip-unchanged`, on by default).
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: "Build context, relative to the repo root. Also the default Dockerfile location."
+        type: string
+        default: "."
+      dockerfile:
+        description: "Path to the Dockerfile. Defaults to '<context>/Dockerfile'."
+        type: string
+        default: ""
+      image:
+        description: "Full image ref without tag, e.g. ghcr.io/org/app-backend. Defaults to ghcr.io/<owner>/<repo>-<basename(context)>."
+        type: string
+        default: ""
+      tags:
+        description: "Multiline docker/metadata-action tag rules. 'type=raw,value=sha-{{sha}}' is always added in addition."
+        type: string
+        default: ""
+      build-args:
+        description: "Multiline KEY=VALUE build args."
+        type: string
+        default: ""
+      target:
+        description: "Multi-stage build target."
+        type: string
+        default: ""
+      platforms:
+        description: "Comma-separated platforms, e.g. linux/amd64,linux/arm64. QEMU is only set up when more than one is listed."
+        type: string
+        default: "linux/amd64"
+      build-contexts:
+        description: "Multiline extra named build contexts, e.g. 'shared=../libs'."
+        type: string
+        default: ""
+      pre-build:
+        description: "Shell snippet run (with the context as cwd) before the build, for codegen/asset fetching/etc."
+        type: string
+        default: ""
+      push:
+        description: "Push the built image. Set to false for PR validation builds."
+        type: boolean
+        default: true
+      cache:
+        description: "registry | gha | none"
+        type: string
+        default: "registry"
+      skip-unchanged:
+        description: "Retag an existing image instead of rebuilding when the source tree hash is unchanged."
+        type: boolean
+        default: true
+      registry:
+        description: "Container registry host."
+        type: string
+        default: "ghcr.io"
+      registry-username:
+        description: "Registry login username."
+        type: string
+        default: ""
+      notify-on:
+        description: "Comma-separated subset of: started,success,failure. Empty = no notifications."
+        type: string
+        default: ""
+      runs-on:
+        description: "Runner label."
+        type: string
+        default: "ubuntu-latest"
+    secrets:
+      registry-password:
+        description: "Registry login password/token. Defaults to GITHUB_TOKEN (works for ghcr.io)."
+        required: false
+      build-secrets:
+        description: "Multiline id=value pairs, mounted via --mount=type=secret,id=<id>."
+        required: false
+      NOTIFY_URL:
+        required: false
+    outputs:
+      image:
+        description: "Resolved image ref without a tag."
+        value: ${{ jobs.build.outputs.image }}
+      tag:
+        description: "The guaranteed sha-<short sha> tag that was pushed."
+        value: ${{ jobs.build.outputs.tag }}
+      tags:
+        description: "Newline-separated list of every tag that was pushed."
+        value: ${{ jobs.build.outputs.tags }}
+      digest:
+        description: "Content digest of the pushed image (sha256:...)."
+        value: ${{ jobs.build.outputs.digest }}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      tag: ${{ steps.resolve.outputs.sha_tag }}
+      tags: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.export-digest.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve image name and Dockerfile
+        id: resolve
+        shell: bash
+        run: |
+          image="${{ inputs.image }}"
+          if [ -z "$image" ]; then
+            owner="${GITHUB_REPOSITORY_OWNER,,}"
+            repo_base="$(basename "${GITHUB_REPOSITORY,,}")"
+            ctx_base="$(basename "${{ inputs.context }}")"
+            if [ "$ctx_base" = "." ]; then
+              image="${{ inputs.registry }}/${owner}/${repo_base}"
+            else
+              image="${{ inputs.registry }}/${owner}/${repo_base}-${ctx_base}"
+            fi
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+          dockerfile="${{ inputs.dockerfile }}"
+          [ -z "$dockerfile" ] && dockerfile="${{ inputs.context }}/Dockerfile"
+          echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+
+          short_sha="${GITHUB_SHA:0:7}"
+          echo "sha_tag=sha-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Notify - build started
+        if: contains(inputs.notify-on, 'started')
+        uses: maciej23/cicd/actions/notify@v1
+        with:
+          notify-url: ${{ secrets.NOTIFY_URL }}
+          status: started
+          title: "🔨 Build started: ${{ steps.resolve.outputs.image }}"
+          fields: |
+            Branch|${{ github.ref_name }}
+            Triggered by|${{ github.actor }}
+            Context|${{ inputs.context }}
+
+      - name: Run pre-build hook
+        if: inputs.pre-build != ''
+        shell: bash
+        working-directory: ${{ inputs.context }}
+        run: ${{ inputs.pre-build }}
+
+      - name: Set up QEMU (multi-platform only)
+        if: contains(inputs.platforms, ',')
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3
+
+      - name: Log in to registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || secrets.GITHUB_TOKEN }}
+
+      - name: Compute source hash (for skip-unchanged)
+        id: srchash
+        if: inputs.skip-unchanged
+        shell: bash
+        run: |
+          ctx_tree=$(git rev-parse "HEAD:${{ inputs.context }}" 2>/dev/null || echo "no-ctx")
+          dockerfile_blob=$(git hash-object "${{ steps.resolve.outputs.dockerfile }}" 2>/dev/null || echo "no-dockerfile")
+          hash=$(
+            {
+              echo "$ctx_tree"
+              echo "$dockerfile_blob"
+              echo "${{ inputs.build-args }}"
+              echo "${{ inputs.target }}"
+              echo "${{ inputs.platforms }}"
+              echo "${{ inputs.build-contexts }}"
+            } | sha256sum | cut -c1-16
+          )
+          src_tag="src-${hash}"
+          echo "src_tag=$src_tag" >> "$GITHUB_OUTPUT"
+
+          full_ref="${{ steps.resolve.outputs.image }}:${src_tag}"
+          if docker buildx imagetools inspect "$full_ref" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5
+        with:
+          images: ${{ steps.resolve.outputs.image }}
+          tags: |
+            ${{ inputs.tags }}
+            type=raw,value=sha-{{sha}}
+
+      - name: Retag existing image (source unchanged)
+        id: retag
+        if: inputs.skip-unchanged && steps.srchash.outputs.hit == 'true' && inputs.push
+        shell: bash
+        run: |
+          src_ref="${{ steps.resolve.outputs.image }}:${{ steps.srchash.outputs.src_tag }}"
+          echo "Source unchanged, retagging $src_ref instead of rebuilding" >&2
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            docker buildx imagetools create --tag "$tag" "$src_ref"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          digest=$(docker buildx imagetools inspect "$src_ref" --format '{{json .Manifest}}' | jq -r '.digest')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "did_retag=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up registry cache refs
+        id: cache
+        if: steps.retag.outputs.did_retag != 'true'
+        shell: bash
+        run: |
+          case "${{ inputs.cache }}" in
+            registry)
+              echo "from=type=registry,ref=${{ steps.resolve.outputs.image }}:buildcache" >> "$GITHUB_OUTPUT"
+              if [ "${{ inputs.push }}" = "true" ]; then
+                echo "to=type=registry,ref=${{ steps.resolve.outputs.image }}:buildcache,mode=max,image-manifest=true" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            gha)
+              echo "from=type=gha,scope=${{ steps.resolve.outputs.image }}" >> "$GITHUB_OUTPUT"
+              echo "to=type=gha,mode=max,scope=${{ steps.resolve.outputs.image }}" >> "$GITHUB_OUTPUT"
+              ;;
+            none) ;;
+          esac
+
+      - name: Build (and push) image
+        id: build
+        if: steps.retag.outputs.did_retag != 'true'
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c3 # v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ steps.resolve.outputs.dockerfile }}
+          target: ${{ inputs.target }}
+          platforms: ${{ inputs.platforms }}
+          build-contexts: ${{ inputs.build-contexts }}
+          push: ${{ inputs.push }}
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ inputs.skip-unchanged && format('{0}:{1}', steps.resolve.outputs.image, steps.srchash.outputs.src_tag) || '' }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ inputs.build-args }}
+          secrets: ${{ secrets.build-secrets }}
+          cache-from: ${{ steps.cache.outputs.from }}
+          cache-to: ${{ steps.cache.outputs.to }}
+
+      - name: Export digest
+        id: export-digest
+        shell: bash
+        run: |
+          digest="${{ steps.build.outputs.digest }}"
+          [ -z "$digest" ] && digest="${{ steps.retag.outputs.digest }}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## 🐳 Docker build — \`${{ steps.resolve.outputs.image }}\`"
+            echo
+            if [ "${{ steps.retag.outputs.did_retag }}" = "true" ]; then
+              echo "> ♻️ Source unchanged — existing image retagged, no rebuild."
+            fi
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Context | \`${{ inputs.context }}\` |"
+            echo "| Dockerfile | \`${{ steps.resolve.outputs.dockerfile }}\` |"
+            echo "| Platforms | \`${{ inputs.platforms }}\` |"
+            echo "| Pushed | \`${{ inputs.push }}\` |"
+            echo "| Digest | \`${{ steps.export-digest.outputs.digest }}\` |"
+            echo
+            echo "### Tags"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            if [ "${{ inputs.push }}" = "true" ] && [ -n "${{ steps.export-digest.outputs.digest }}" ]; then
+              echo
+              echo "\`\`\`sh"
+              echo "docker pull ${{ steps.resolve.outputs.image }}@${{ steps.export-digest.outputs.digest }}"
+              echo "\`\`\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify - build failed
+        if: failure() && contains(inputs.notify-on, 'failure')
+        uses: maciej23/cicd/actions/notify@v1
+        with:
+          notify-url: ${{ secrets.NOTIFY_URL }}
+          status: failure
+          title: "💥 Build failed: ${{ steps.resolve.outputs.image }}"
+          fields: |
+            Branch|${{ github.ref_name }}
+            Context|${{ inputs.context }}
+
+      - name: Notify - build succeeded
+        if: success() && contains(inputs.notify-on, 'success')
+        uses: maciej23/cicd/actions/notify@v1
+        with:
+          notify-url: ${{ secrets.NOTIFY_URL }}
+          status: success
+          title: "✅ Build succeeded: ${{ steps.resolve.outputs.image }}"
+          fields: |
+            Branch|${{ github.ref_name }}
+            Tags|${{ steps.meta.outputs.tags }}
+            Digest|${{ steps.export-digest.outputs.digest }}

@@ -1,0 +1,42 @@
+# Single-component repo, e.g. a backend living at the repo root or in one
+# subdirectory. Build -> deploy via flux, with Discord notifications on.
+name: backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: maciej23/cicd/.github/workflows/docker-build.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    with:
+      context: backend
+      tags: |
+        type=raw,value=dev
+        type=raw,value=dev-{{sha}}
+      build-args: |
+        APP_VERSION=${{ github.ref_name }}-${{ github.sha }}
+      notify-on: failure
+    secrets:
+      NOTIFY_URL: ${{ secrets.NOTIFY_URL }}
+
+  deploy:
+    needs: build
+    uses: maciej23/cicd/.github/workflows/flux-deploy.yml@v1
+    with:
+      environment: plume
+      path: apps/plume/myapp
+      images: ${{ needs.build.outputs.image }}=${{ needs.build.outputs.tag }}@${{ needs.build.outputs.digest }}
+      changelog-paths: |
+        backend
+      notify-on: success,failure
+    secrets:
+      FLUX_TOKEN: ${{ secrets.FLUX_CONFIG_PUSH_TOKEN }}
+      NOTIFY_URL: ${{ secrets.NOTIFY_URL }}
