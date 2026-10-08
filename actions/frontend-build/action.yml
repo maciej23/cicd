@@ -89,7 +89,7 @@ runs:
 
     - name: Install pnpm
       if: steps.detect.outputs.pm == 'pnpm'
-      uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4
+      uses: pnpm/action-setup@v6
       with:
         version: ${{ steps.detect.outputs.pnpm_version }}
 
@@ -110,7 +110,7 @@ runs:
         echo "path=$resolved" >> "$GITHUB_OUTPUT"
 
     - name: Set up Node (cached)
-      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v5
+      uses: actions/setup-node@v7
       with:
         node-version-file: ${{ steps.nodefile.outputs.path || '' }}
         node-version: ${{ steps.nodefile.outputs.path == '' && '22' || '' }}
@@ -147,7 +147,7 @@ runs:
     - name: Restore previous build output
       if: inputs.skip-unchanged == 'true'
       id: cache-dist
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache@v6
       with:
         path: ${{ inputs.working-directory }}/${{ inputs.output-dir }}
         key: ${{ steps.decide.outputs.cache-key }}

@@ -78,7 +78,7 @@ jobs:
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
       - name: Checkout calling repo (full history, for the changelog)
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+        uses: actions/checkout@v7
         with:
           path: app
           fetch-depth: 0
@@ -98,7 +98,7 @@ jobs:
           chmod +x /usr/local/bin/yq
 
       - name: Checkout flux-config
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.flux-repo }}
           ref: ${{ inputs.flux-branch }}

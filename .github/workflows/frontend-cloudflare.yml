@@ -78,7 +78,7 @@ jobs:
       alias_url: ${{ steps.pages.outputs.alias-url || steps.pages.outputs.deployment-url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+        uses: actions/checkout@v7
 
       - name: Build frontend
         id: build
@@ -97,7 +97,7 @@ jobs:
 
       - name: Deploy to Cloudflare Pages
         id: pages
-        uses: cloudflare/wrangler-action@392082e81ffbcb9ebdde27400634aa004b35535b # v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

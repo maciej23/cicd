@@ -9,22 +9,22 @@ jobs:
   actionlint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
-      - uses: reviewdog/action-actionlint@a5520facccb761e5f3236e62f2db68ca03cf101c # v1
+      - uses: actions/checkout@v7
+      - uses: reviewdog/action-actionlint@v1
         with:
           fail_level: error
 
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+      - uses: actions/checkout@v7
       - name: shellcheck provider scripts
         run: shellcheck actions/notify/providers/*.sh
 
   zizmor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+      - uses: actions/checkout@v7
       - name: Run zizmor (workflow security lint)
         run: |
           pipx install zizmor
