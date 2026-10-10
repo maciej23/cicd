@@ -4,9 +4,6 @@ Shared, reusable GitHub Actions workflows for building containers, deploying
 them via [flux-config](https://github.com/maciej23/flux-config), and
 building/deploying frontends to Cloudflare Pages.
 
-See [`PLAN.md`](./PLAN.md) for the original design write-up and rationale.
-This README is the day-to-day usage reference.
-
 ## Repo access
 
 This repo is private. Each repo that wants to call these workflows needs
@@ -225,5 +222,4 @@ actions/
     providers/telegram.sh
   frontend-build/            provider-agnostic frontend build (detect/cache/build)
 examples/                    copy-paste caller workflows
-PLAN.md                      original design doc
 ```
